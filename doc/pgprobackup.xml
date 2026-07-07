@@ -4429,6 +4429,12 @@ pg_probackup backup -B <replaceable>backup_dir</replaceable> -b <replaceable>bac
         Disables block-level checksum verification to speed up
         the backup process.
       </para>
+      <warning>
+        <para>
+          <option>--skip-block-validation</option> is not supported in the remote
+          mode.
+        </para>
+      </warning>
       </listitem>
       </varlistentry>
 
@@ -4613,6 +4619,12 @@ pg_probackup restore -B <replaceable>backup_dir</replaceable> --instance=<replac
         validation. During automatic validation before the restore only
         file-level checksums will be verified.
       </para>
+      <warning>
+        <para>
+          <option>--skip-block-validation</option> is not supported in the remote
+          mode.
+        </para>
+      </warning>
       </listitem>
       </varlistentry>
 
@@ -4772,6 +4784,12 @@ pg_probackup checkdb
         together with the <option>--amcheck</option> flag, so that only logical
         verification of indexes is performed.
       </para>
+      <warning>
+        <para>
+          <option>--skip-block-validation</option> is not supported in the remote
+          mode.
+        </para>
+      </warning>
       </listitem>
       </varlistentry>
 
