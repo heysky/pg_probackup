@@ -195,12 +195,9 @@ catchup_preflight_checks(PGNodeInfo *source_node_info, PGconn *source_conn,
 	}
 
 	/* check WAL summarize support */
-	if (current.backup_mode == BACKUP_MODE_DIFF_SUMMARIZE)
-	{
-		PGconn *conn = pgdata_basic_setup(instance_config.conn_opt, source_node_info);
-		if (!pg_is_walsummary_enabled(conn))
-			elog(ERROR, "WAL summarize backup mode requires summarize_wal to be enabled in PostgreSQL 17+");
-	}
+	if (current.backup_mode == BACKUP_MODE_DIFF_SUMMARIZE &&
+		!pg_is_walsummary_enabled(source_conn))
+		elog(ERROR, "WAL summarize backup mode requires PostgreSQL 17+ with summarize_wal enabled");
 
 	if (current.from_replica && exclusive_backup)
 		elog(ERROR, "Catchup from standby is only available for PostgreSQL >= 9.6");
@@ -703,7 +700,9 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 	}
 
 	/*
-	 * Make sure that sync point is within WAL summarize tracking range
+	 * Make sure that WAL summarizer has caught up to current.start_lsn,
+	 * so that summary files covering [dest_redo.lsn, current.start_lsn]
+	 * are available for building the pagemap.
 	 */
 	if (current.backup_mode == BACKUP_MODE_DIFF_SUMMARIZE)
 	{
@@ -712,10 +711,18 @@ do_catchup(const char *source_pgdata, const char *dest_pgdata, int num_threads, 
 		if (summarized_lsn == InvalidXLogRecPtr)
 			elog(ERROR, "WAL summarizer state is not available");
 		if (summarized_lsn < dest_redo.lsn)
-			elog(WARNING, "WAL summarizer has only reached %X/%X, which is before destination checkpoint LSN %X/%X. "
-						"Some changes may be missed.",
+			elog(ERROR, "WAL summarizer has only reached %X/%X, which is before destination checkpoint LSN %X/%X. "
+						"Catchup cannot proceed without complete WAL summaries.",
 						(uint32) (summarized_lsn >> 32), (uint32) (summarized_lsn),
 						(uint32) (dest_redo.lsn >> 32), (uint32) (dest_redo.lsn));
+		if (!wait_wal_summarization(source_conn, current.start_lsn,
+									instance_config.archive_timeout))
+			elog(ERROR, "WAL summarizer did not catch up to %X/%X within %u seconds. "
+						"Catchup cannot proceed without complete WAL summaries. "
+						"Consider increasing --archive-timeout.",
+						(uint32) (current.start_lsn >> 32),
+						(uint32) (current.start_lsn),
+						instance_config.archive_timeout);
 	}
 
 	{

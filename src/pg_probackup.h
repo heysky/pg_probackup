@@ -1277,7 +1277,8 @@ extern void make_pagemap_from_walsummary(parray* files, PGconn* backup_conn,
 										  TimeLineID tli);
 extern bool pg_is_walsummary_enabled(PGconn *backup_conn);
 extern XLogRecPtr get_walsummary_summarized_lsn(PGconn *backup_conn);
-extern bool wait_wal_summarization(PGconn *backup_conn, XLogRecPtr target_lsn);
+extern bool wait_wal_summarization(PGconn *backup_conn, XLogRecPtr target_lsn,
+								   int max_wait_seconds);
 
 /* open local file to writing */
 extern FILE* open_local_file_rw(const char *to_fullpath, char **out_buf, uint32 buf_size);

@@ -18,7 +18,10 @@
 
 /*
  * Check if the server has WAL summarize enabled.
- * Returns true if summarize_wal is enabled, false otherwise.
+ * Returns true if PostgreSQL is 17+ AND summarize_wal is enabled.
+ * Returns false otherwise (caller is responsible for emitting an ERROR
+ * with appropriate context — this function stays silent so the caller
+ * can produce a single, specific error message).
  */
 bool
 pg_is_walsummary_enabled(PGconn *backup_conn)
@@ -43,10 +46,7 @@ pg_is_walsummary_enabled(PGconn *backup_conn)
 		PQclear(res);
 
 		if (version_num < 170000)
-		{
-			elog(WARNING, "WAL summarize backup mode requires PostgreSQL 17 or higher");
 			return false;
-		}
 	}
 
 	/* Check if summarize_wal is enabled */
@@ -108,16 +108,17 @@ get_walsummary_summarized_lsn(PGconn *backup_conn)
  * will have complete information.
  *
  * Parameters:
- *   backup_conn - connection to the PostgreSQL server
- *   target_lsn  - the LSN we need the summarizer to reach
+ *   backup_conn       - connection to the PostgreSQL server
+ *   target_lsn        - the LSN we need the summarizer to reach
+ *   max_wait_seconds  - maximum time to wait before giving up
  *
  * Returns true if summarizer caught up, false if it was disabled or failed
  */
 bool
-wait_wal_summarization(PGconn *backup_conn, XLogRecPtr target_lsn)
+wait_wal_summarization(PGconn *backup_conn, XLogRecPtr target_lsn,
+					   int max_wait_seconds)
 {
 	int			wait_seconds = 0;
-	int			max_wait_seconds = 60;	/* Maximum wait time: 60 seconds */
 	int			check_interval = 1;		/* Check every second */
 	XLogRecPtr	last_summarized_lsn = InvalidXLogRecPtr;
 	time_t		start_time;
@@ -125,6 +126,10 @@ wait_wal_summarization(PGconn *backup_conn, XLogRecPtr target_lsn)
 
 	if (XLogRecPtrIsInvalid(target_lsn))
 		return true;	/* Nothing to wait for */
+
+	/* Fall back to a sane default if caller passed a non-positive value */
+	if (max_wait_seconds <= 0)
+		max_wait_seconds = ARCHIVE_TIMEOUT_DEFAULT;
 
 	snprintf(target_lsn_str, sizeof(target_lsn_str), "%X/%X",
 			 (uint32) (target_lsn >> 32), (uint32) target_lsn);
@@ -321,10 +326,14 @@ make_pagemap_from_walsummary(parray *files,
 			 summary_start_lsn, summary_end_lsn);
 
 		/*
-		 * Calculate the overlap range between:
-		 * - Summary file range: [summary_start_lsn, summary_end_lsn]
-		 * - Requested range: [start_lsn, end_lsn]
-		 * We want to query the intersection of these ranges.
+		 * Query the summary file contents using the original file borders.
+		 * pg_wal_summary_contents() uses start_lsn and end_lsn to construct
+		 * the filename, so we must pass the exact values from
+		 * pg_available_wal_summaries(). Using clipped/intersected LSN values
+		 * would cause a "file not found" error.
+		 *
+		 * We already filtered summary files to only those overlapping our
+		 * requested range, so all returned blocks are relevant.
 		 */
 		snprintf(query, sizeof(query),
 				 "SELECT "
@@ -334,13 +343,11 @@ make_pagemap_from_walsummary(parray *files,
 					"relforknumber, "
 					"relblocknumber "
 					"FROM pg_wal_summary_contents("
-					"%u, GREATEST('%s'::pg_lsn, '%s'::pg_lsn), "
-					"LEAST('%s'::pg_lsn, '%s'::pg_lsn)) "
+					"%u, '%s'::pg_lsn, '%s'::pg_lsn) "
 					"WHERE NOT is_limit_block "
 					"ORDER BY reldatabase, reltablespace, relfilenode, relforknumber, relblocknumber",
 					tli,
-					summary_start_lsn, start_lsn_str,
-					summary_end_lsn, end_lsn_str);
+					summary_start_lsn, summary_end_lsn);
 
 		block_res = pgut_execute(backup_conn, query, 0, NULL);
 
@@ -357,10 +364,11 @@ make_pagemap_from_walsummary(parray *files,
 			Oid			curr_relfilenode;
 			int			curr_fork_number;
 			ForkName	curr_fork_name;
+			BlockMapEntry *map;
 
-			curr_db_oid = atoi(PQgetvalue(block_res, j, 0));
-			curr_tblspc_oid = atoi(PQgetvalue(block_res, j, 1));
-			curr_relfilenode = atoi(PQgetvalue(block_res, j, 2));
+			curr_db_oid = atooid(PQgetvalue(block_res, j, 0));
+			curr_tblspc_oid = atooid(PQgetvalue(block_res, j, 1));
+			curr_relfilenode = atooid(PQgetvalue(block_res, j, 2));
 			curr_fork_number = atoi(PQgetvalue(block_res, j, 3));
 
 			/* Map fork number to ForkName */
@@ -383,49 +391,31 @@ make_pagemap_from_walsummary(parray *files,
 						 curr_fork_number, curr_relfilenode);
 					/* Skip to next file */
 					while (j < PQntuples(block_res) &&
-						   atoi(PQgetvalue(block_res, j, 0)) == curr_db_oid &&
-						   atoi(PQgetvalue(block_res, j, 1)) == curr_tblspc_oid &&
-						   atoi(PQgetvalue(block_res, j, 2)) == curr_relfilenode &&
+						   atooid(PQgetvalue(block_res, j, 0)) == curr_db_oid &&
+						   atooid(PQgetvalue(block_res, j, 1)) == curr_tblspc_oid &&
+						   atooid(PQgetvalue(block_res, j, 2)) == curr_relfilenode &&
 						   atoi(PQgetvalue(block_res, j, 3)) == curr_fork_number)
 						j++;
 					continue;
 			}
 
-			/* Check if we already have an entry for this file */
-			BlockMapEntry key;
-			BlockMapEntry **found_entry;
-			BlockMapEntry *map = NULL;
-
-			key.dbOid = curr_db_oid;
-			key.tblspcOid = curr_tblspc_oid;
-			key.relOid = curr_relfilenode;
-			key.forkName = curr_fork_name;
-			key.blocknums = NULL;
-
-			found_entry = (BlockMapEntry **) parray_bsearch(blockmap_list, &key, blockmap_compare);
-			if (found_entry)
-				map = *found_entry;
-
-			/* Create new entry if not found */
-			if (!map)
-			{
-				map = pgut_malloc(sizeof(BlockMapEntry));
-				map->dbOid = curr_db_oid;
-				map->tblspcOid = curr_tblspc_oid;
-				map->relOid = curr_relfilenode;
-				map->forkName = curr_fork_name;
-				map->blocknums = parray_new();
-				parray_append(blockmap_list, map);
-			}
+			map = pgut_malloc(sizeof(BlockMapEntry));
+			map->dbOid = curr_db_oid;
+			map->tblspcOid = curr_tblspc_oid;
+			map->relOid = curr_relfilenode;
+			map->forkName = curr_fork_name;
+			map->blocknums = parray_new();
+			parray_append(blockmap_list, map);
 
 			/* Collect all blocks for this file */
 			while (j < PQntuples(block_res))
 			{
-				Oid			db_oid = atoi(PQgetvalue(block_res, j, 0));
-				Oid			tblspc_oid = atoi(PQgetvalue(block_res, j, 1));
-				Oid			relfilenode = atoi(PQgetvalue(block_res, j, 2));
+				Oid			db_oid = atooid(PQgetvalue(block_res, j, 0));
+				Oid			tblspc_oid = atooid(PQgetvalue(block_res, j, 1));
+				Oid			relfilenode = atooid(PQgetvalue(block_res, j, 2));
 				int			fork_number = atoi(PQgetvalue(block_res, j, 3));
-				BlockNumber	block_number = atoi(PQgetvalue(block_res, j, 4));
+				BlockNumber	block_number = (BlockNumber) strtoul(PQgetvalue(block_res, j, 4), NULL, 10);
+				BlockNumber *blk;
 
 				if (db_oid != curr_db_oid ||
 					tblspc_oid != curr_tblspc_oid ||
@@ -433,7 +423,7 @@ make_pagemap_from_walsummary(parray *files,
 					fork_number != curr_fork_number)
 					break;
 
-				BlockNumber *blk = palloc(sizeof(BlockNumber));
+				blk = palloc(sizeof(BlockNumber));
 				*blk = block_number;
 				parray_append(map->blocknums, blk);
 				total_blocks++;
@@ -446,16 +436,50 @@ make_pagemap_from_walsummary(parray *files,
 
 	PQclear(res);
 
-	elog(INFO, "Mapped %d changed blocks to %d files", total_blocks, parray_num(blockmap_list));
-
-	/* Sort the blockmap list for binary search */
+	/* Sort the blockmap list and merge duplicate entries */
 	if (parray_num(blockmap_list) > 0)
+	{
+		parray	   *merged_list;
+		BlockMapEntry *prev = NULL;
+		int			k;
+
 		parray_qsort(blockmap_list, blockmap_compare);
+
+		/* Merge consecutive entries with the same key */
+		merged_list = parray_new();
+		for (k = 0; k < parray_num(blockmap_list); k++)
+		{
+			BlockMapEntry *curr = (BlockMapEntry *) parray_get(blockmap_list, k);
+
+			if (prev && blockmap_compare(&prev, &curr) == 0)
+			{
+				/* Same file: merge blocks from curr into prev */
+				int		b;
+				for (b = 0; b < parray_num(curr->blocknums); b++)
+					parray_append(prev->blocknums, parray_get(curr->blocknums, b));
+				parray_free(curr->blocknums);
+				pfree(curr);
+			}
+			else
+			{
+				parray_append(merged_list, curr);
+				prev = curr;
+			}
+		}
+		parray_free(blockmap_list);
+		blockmap_list = merged_list;
+	}
+
+	elog(INFO, "Mapped %d changed blocks to %zu files",
+		 total_blocks, parray_num(blockmap_list));
 
 	/* Iterate over files and match with WAL summary data */
 	for (file_i = 0; file_i < parray_num(files); file_i++)
 	{
 		pgFile	   *file = (pgFile *) parray_get(files, file_i);
+		BlockMapEntry key;
+		BlockMapEntry **found_entry;
+		BlockMapEntry *map = NULL;
 		int			j;
 
 		if (!file->is_datafile || file->is_cfs)
@@ -464,10 +488,6 @@ make_pagemap_from_walsummary(parray *files,
 			continue;
 
 		/* Binary search for matching blockmap entry */
-		BlockMapEntry key;
-		BlockMapEntry **found_entry;
-		BlockMapEntry *map = NULL;
-
 		key.dbOid = file->dbOid;
 		key.tblspcOid = file->tblspcOid;
 		key.relOid = file->relOid;
@@ -483,7 +503,7 @@ make_pagemap_from_walsummary(parray *files,
 		{
 			int			nblocks;
 
-			elog(VERBOSE, "Building pagemap for file \"%s\" with %d changed blocks",
+			elog(VERBOSE, "Building pagemap for file \"%s\" with %zu changed blocks",
 				 file->rel_path, parray_num(map->blocknums));
 
 			/* Determine file size in blocks */
@@ -496,16 +516,27 @@ make_pagemap_from_walsummary(parray *files,
 			file->pagemap.bitmapsize = 0;
 			file->pagemap.bitmap = NULL;
 
-			/* Set bits for changed blocks */
+			/*
+			 * WAL summary contains absolute block numbers. For relations
+			 * larger than 1GB, blocks are split into segment files.
+			 * We must convert absolute block numbers to segment-relative
+			 * block numbers and only add blocks belonging to this segment.
+			 */
 			for (j = 0; j < parray_num(map->blocknums); j++)
 			{
 				BlockNumber blknum = *(BlockNumber *) parray_get(map->blocknums, j);
+				BlockNumber blkno_inseg = blknum % RELSEG_SIZE;
+				int			segno = blknum / RELSEG_SIZE;
 
-				if (blknum < nblocks)
-					datapagemap_add(&file->pagemap, blknum);
+				/* Skip blocks not in this segment */
+				if (segno != file->segno)
+					continue;
+
+				if (blkno_inseg < (BlockNumber) nblocks)
+					datapagemap_add(&file->pagemap, blkno_inseg);
 				else
-					elog(WARNING, "Block number %u exceeds file size (%d blocks) for \"%s\"",
-						 blknum, nblocks, file->rel_path);
+					elog(WARNING, "Block number %u (segment %d, offset %u) exceeds file size (%d blocks) for \"%s\"",
+						 blknum, segno, blkno_inseg, nblocks, file->rel_path);
 			}
 		}
 	}
